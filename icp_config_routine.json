@@ -1,0 +1,9 @@
+{
+  "sheets_key": "173ECebhTxtPCbwmDCJ60-rUSHEo4xU2OgIcoekmAZuQ",
+  "offer": "I will build you a world class custom CRM for HVAC service companies to manage all your leads. So that your company has a 1 central place to see all the projects. So you guys save time, able to take on more clients and therefore more revenue.",
+  "icp_criteria": "Company where HVAC install, cleaning, servicing, or repair (residential OR commercial) is one of its TOP 3 SERVICE LINES by prominence. Qualify YES whenever HVAC is among the top 3: HVAC + HVAC-adjacent work (refrigeration, ductwork/sheet metal, ventilation, indoor air quality, boilers); plumbing + heating/cooling combos; mechanical or MEP contractors; and ~3-trade home-services firms (e.g. HVAC + electrical + plumbing). Answer NO when the company is a broad multi-trade generalist offering many (~4+) distinct, largely-unrelated trades and HVAC is NOT in the top 3 (e.g. fire alarm/sprinkler + electrical + lightning protection + civil/demolition + environmental + HVAC). 2-100 employees. Decision maker (Owner, President, CEO, COO, VP, or similar). Exclude: pure equipment distributors, equipment sales reps and manufacturer's representatives, pure staffing/caulking/remodeling, and design/engineering/consulting/recruiting/staffing-only firms with no in-house HVAC install or service. EMPLOYEE COUNT: only disqualify if you find an EXPLICIT stated headcount >100 from the company website, LinkedIn About page, or a named database (D&B, ZoomInfo). Number of locations, revenue, project size, or enterprise language = ignore. No explicit count = do not disqualify.",
+  "model": "claude-haiku-4-5-20251001",
+  "max_leads_per_run": 10,
+  "max_searches_per_lead": 3,
+  "token_budget_per_run": 600000
+}
