@@ -12,7 +12,6 @@ WHAT IT DOES
 CONFIG (icp_config.json next to this script):
 {
   "sheets_key": "...",
-  "offer": "...",
   "icp_criteria": "...",
   "model": "claude-sonnet-4-6",
   "max_leads_per_run": 5,
@@ -47,6 +46,11 @@ if hasattr(sys.stderr, "buffer"):
 
 _log_file = None
 _quiet = False
+
+# Hard ceiling for a single `claude -p` verdict call. Haiku + <=3 searches finishes well
+# under a minute; 120s turns a stuck subprocess into a fast skip (retried next run) and keeps
+# a 10-lead batch's worst case inside the skill's 600s tool timeout.
+CLAUDE_TIMEOUT_S = 120
 
 try:
     import gspread
@@ -90,10 +94,19 @@ _DISTRIBUTOR_NAME_WORDS = {
 }
 
 # Distributor/supplier language in WEBSITE CONTENT — disqualifies instant-YES from both tiers.
-_DISTRIBUTOR_SIGNALS = [
-    "wholesale", "distribut", "supply house", "manufacturer", "parts suppl",
-    "hvac parts", "hvac supplies", "hvac equipment for sale", "shop hvac",
-]
+# Word-boundary regexes, NOT substrings: the old "distribut" substring also hit "distributed"
+# and "air distribution" (a ductwork/service term), wrongly routing service firms to Claude.
+_DISTRIBUTOR_SIGNALS = [re.compile(p) for p in (
+    r"\bwholesale\w*\b",
+    r"\bdistributors?\b",
+    r"\bsupply\s+house\b",
+    r"\bmanufacturer\w*\b",
+    r"\bparts\s+suppl\w*\b",
+    r"\bhvac\s+parts\b",
+    r"\bhvac\s+supplies\b",
+    r"\bhvac\s+equipment\s+for\s+sale\b",
+    r"\bshop\s+hvac\b",
+)]
 
 # Regex patterns indicating unambiguous HVAC *service* (not supply/distribution) on the website.
 _HVAC_SERVICE_PATTERNS = [
@@ -161,10 +174,32 @@ def vlog(msg):
         _log_file.flush()
 
 
+def hb(msg):
+    """Progress heartbeat to stdout even under --quiet (where per-lead logs are suppressed),
+    so a genuine hang is distinguishable from slow progress. Not the ICP_VERIFY_SUMMARY line."""
+    if _quiet:
+        print(msg, flush=True)
+
+
+def _with_retry(fn, what, attempts=3):
+    """Run a (possibly networked) gspread call with bounded retries + backoff.
+    Paired with the client-level timeout set in open_sheet(): a stalled call now raises
+    (e.g. ReadTimeout) instead of hanging forever, and this absorbs transient failures."""
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except Exception as e:
+            if attempt == attempts - 1:
+                raise
+            log(f"  {what} failed (attempt {attempt + 1}/{attempts}): {e}. Retrying...")
+            time.sleep(2 ** attempt)
+
+
 def load_config(path):
     with open(path, "r", encoding="utf-8") as f:
         cfg = json.load(f)
-    required = ["offer", "icp_criteria", "model"]
+    # "offer" is intentionally NOT required — it appears in older configs but is never used.
+    required = ["icp_criteria", "model"]
     missing = [k for k in required if not cfg.get(k)]
     if missing:
         sys.exit(f"Config missing required fields: {', '.join(missing)}")
@@ -190,13 +225,26 @@ def open_sheet(cfg):
             sys.exit(f"ICP_SA_KEY_B64 is set but not valid base64-encoded JSON: {e}")
         gc = gspread.service_account_from_dict(info)
     else:
+        # Fail fast in skill/non-interactive (--quiet) runs: gspread.oauth() with no cached
+        # token launches an interactive browser auth flow and blocks forever with no timeout.
+        token_path = os.path.join(
+            os.environ.get("APPDATA", os.path.expanduser("~/.config")),
+            "gspread", "authorized_user.json")
+        if _quiet and not os.path.exists(token_path):
+            sys.exit(
+                f"No cached gspread OAuth token at {token_path} and running non-interactively "
+                f"(--quiet) — refusing to block on a browser auth flow. "
+                f"Fix once with: python -c \"import gspread; gspread.oauth()\"")
         gc = gspread.oauth()
+    # Bound every Sheets API call so a stalled connection can't hang the run forever.
+    # gspread 6.x forwards this to requests as (connect, read) seconds.
+    gc.set_timeout((10, 30))
     sh = gc.open_by_key(cfg["sheets_key"])
     return sh.get_worksheet(0)
 
 
 def get_unprocessed_rows(ws, force=False):
-    all_values = ws.get_all_values()
+    all_values = _with_retry(ws.get_all_values, "Sheet read")
     if not all_values:
         return []
     headers = all_values[0]
@@ -214,7 +262,7 @@ def get_unprocessed_rows(ws, force=False):
 
 
 def get_col_map(ws):
-    headers = ws.row_values(1)
+    headers = _with_retry(lambda: ws.row_values(1), "Header read")
     result = {}
     for col_name, key in [(VERIFIED_ICP_COL, "qualified"), (WHY_COL, "why")]:
         try:
@@ -230,15 +278,7 @@ def write_result(ws, row_num, verdict, col_map):
         {"range": f"{col_map['qualified']}{row_num}", "values": [[verdict["qualified"]]]},
         {"range": f"{col_map['why']}{row_num}", "values": [[why]]},
     ]
-    for attempt in range(3):
-        try:
-            ws.batch_update(updates)
-            return
-        except Exception as e:
-            if attempt == 2:
-                raise
-            log(f"  Sheet write failed (attempt {attempt + 1}/3): {e}. Retrying...")
-            time.sleep(2 ** attempt)
+    _with_retry(lambda: ws.batch_update(updates), "Sheet write")
 
 
 def prefetch_website(url):
@@ -316,7 +356,7 @@ def instant_qualify(lead_data, website_content):
     wl = ""
     if website_content:
         wl = website_content.lower()
-        website_is_distributor = any(sig in wl for sig in _DISTRIBUTOR_SIGNALS)
+        website_is_distributor = any(sig.search(wl) for sig in _DISTRIBUTOR_SIGNALS)
         website_is_generalist = (
             sum(1 for sig in _GENERALIST_TRADE_SIGNALS if sig in wl) >= _GENERALIST_TRADE_THRESHOLD
         )
@@ -336,7 +376,21 @@ def instant_qualify(lead_data, website_content):
         if any(re.search(p, wl) for p in _HVAC_SERVICE_PATTERNS):
             return {"qualified": "YES", "why": ""}, "instant-YES (website HVAC service)"
 
-    return None, None
+    # No instant verdict — say WHY it routes to Claude so false-routing patterns show up in the
+    # log. Verdict-neutral: the second element is only ever logged when the first is None.
+    reasons = []
+    if _INSTANT_YES_NAME_WORDS & name_tokens:
+        if name_is_distributor:
+            reasons.append("distributor word in name")
+        if name_is_non_service:
+            reasons.append("non-service word in name")
+    if website_is_distributor:
+        reasons.append("distributor language on website")
+    if website_is_generalist:
+        reasons.append("generalist trade mix on website")
+    if not reasons and website_content:
+        reasons.append("no HVAC service pattern on website")
+    return None, ("to Claude: " + "; ".join(reasons)) if reasons else None
 
 
 def build_prompt(cfg, lead_data, website_content=None, max_searches=3):
@@ -382,26 +436,60 @@ Respond with ONLY this JSON object and nothing else:
 {{"qualified": "YES" or "NO", "why": "<1 sentence for NO, empty string for YES>"}}"""
 
 
-def call_claude(prompt, model):
+def _kill_tree(proc):
+    """Kill proc AND its descendants. `claude -p` spawns helper processes that inherit our
+    capture pipe; killing only the direct child leaves the pipe open in a grandchild, and the
+    post-timeout drain then blocks forever (the old subprocess.run(timeout=...) hang)."""
+    if sys.platform == "win32":
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                       capture_output=True, timeout=30)
+    else:
+        proc.kill()
+
+
+def _popen_capture(cmd, timeout_s):
+    """Run cmd capturing stdout/stderr with a hard timeout.
+    Returns (returncode, stdout, stderr), or (None, None, None) if the timeout fired."""
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, encoding="utf-8", errors="replace")
     try:
-        proc = subprocess.run(
+        out, err = proc.communicate(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        _kill_tree(proc)
+        try:
+            # Tree is dead, so every pipe handle is closed and this drain returns immediately.
+            # The bounded fallback covers a kill race; communicate's reader threads are daemons,
+            # so abandoning the drain can never hang the runner.
+            proc.communicate(timeout=15)
+        except subprocess.TimeoutExpired:
+            pass
+        return None, None, None
+    return proc.returncode, out, err
+
+
+def call_claude(prompt, model, row_ref=""):
+    try:
+        returncode, stdout, stderr = _popen_capture(
             ["claude", "-p", prompt, "--model", model, "--output-format", "json",
              "--allowedTools", "WebSearch,WebFetch"],
-            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=600,
+            timeout_s=CLAUDE_TIMEOUT_S,
         )
     except FileNotFoundError:
         sys.exit("`claude` CLI not found on PATH. Install Claude Code first.")
-    except subprocess.TimeoutExpired:
+
+    if returncode is None:
+        log(f"  {row_ref}claude -p timed out after {CLAUDE_TIMEOUT_S}s; process tree killed.")
         return None, None, None
 
-    if proc.returncode != 0:
-        log(f"  claude exited {proc.returncode}: {(proc.stderr or '').strip()[:200]}")
+    if returncode != 0:
+        log(f"  {row_ref}claude exited {returncode}: {(stderr or '').strip()[:200]}")
         return None, None, None
 
-    if not proc.stdout:
+    if not stdout:
+        vlog(f"  {row_ref}claude exited 0 but produced no stdout.")
         return None, None, None
 
-    raw = proc.stdout.strip()
+    raw = stdout.strip()
     tokens = None
     text = raw
     try:
@@ -416,21 +504,27 @@ def call_claude(prompt, model):
     except json.JSONDecodeError:
         pass
 
-    return parse_verdict(text), tokens, text
+    return parse_verdict(text, row_ref), tokens, text
 
 
-def parse_verdict(text):
+def parse_verdict(text, row_ref=""):
+    """Extract {"qualified": YES|NO, "why": ...} from model output. Every failure mode is
+    vlog'd distinctly so a skipped lead's cause is readable in the log, not a silent None."""
     if not isinstance(text, str):
+        vlog(f"  {row_ref}parse_verdict: no text to parse (got {type(text).__name__}).")
         return None
     start, end = text.find("{"), text.rfind("}")
     if start == -1 or end == -1:
+        vlog(f"  {row_ref}parse_verdict: no JSON object in output: {text.strip()[:100]!r}")
         return None
     try:
         obj = json.loads(text[start:end + 1])
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
+        vlog(f"  {row_ref}parse_verdict: JSON decode error ({e}): {text[start:end + 1][:100]!r}")
         return None
     q = str(obj.get("qualified", "")).strip().upper()
     if q not in ("YES", "NO"):
+        vlog(f"  {row_ref}parse_verdict: 'qualified' is {q!r}, expected YES/NO.")
         return None
     return {
         "qualified": q,
@@ -452,7 +546,13 @@ def main():
 
     _quiet = args.quiet
     if args.log:
-        _log_file = open(args.log, "w", encoding="utf-8")
+        # Append (not truncate) so a killed/hung batch's last log line survives the re-run
+        # that follows — that surviving line is what pinpoints which call stalled.
+        _log_file = open(args.log, "a", encoding="utf-8")
+        _log_file.write(
+            f"\n===== run start {datetime.now().isoformat(timespec='seconds')} "
+            f"| config={os.path.basename(args.config)} | pid={os.getpid()} =====\n")
+        _log_file.flush()
 
     cfg = load_config(args.config)
     budget = cfg["token_budget_per_run"]
@@ -464,6 +564,15 @@ def main():
 
     if not leads:
         log("No unprocessed leads found.")
+        # Emit a zero summary so the orchestrator gets an unambiguous "nothing left" signal
+        # (rows_touched=0) instead of empty --quiet stdout, which is indistinguishable from a hang.
+        print("ICP_VERIFY_SUMMARY " + json.dumps({
+            "instant_no": 0, "tier1_yes": 0, "tier2_yes": 0, "claude_yes": 0,
+            "claude_no": 0, "skipped": 0, "rows_touched": 0, "tokens": 0,
+            "budget": budget, "pct": 0, "log": args.log or None,
+        }), flush=True)
+        if _log_file:
+            _log_file.close()
         return
 
     log(f"Found {len(leads)} unprocessed lead(s). Cap: {lead_cap or 'none'}. Budget: {budget or 'none'}.")
@@ -474,7 +583,7 @@ def main():
     counts = {"instant_no": 0, "tier1_yes": 0, "tier2_yes": 0,
               "claude_yes": 0, "claude_no": 0, "skipped": 0}
 
-    for lead_info in leads:
+    for idx, lead_info in enumerate(leads, start=1):
         if lead_cap and processed >= lead_cap:
             log(f"Reached leads-per-run cap ({lead_cap}). Stopping.")
             break
@@ -487,6 +596,7 @@ def main():
         name = lead_data.get("First Name", "?")
         company = lead_data.get("Company", "?")
         log(f"Row {row_num}: verifying {name} @ {company}")
+        hb(f"[{idx}/{len(leads)}] row {row_num} — {name} @ {company}")
 
         company_tokens = set(w.strip(".,&-()/") for w in company.upper().split())
         if not (_HVAC_OVERRIDE_WORDS & company_tokens):
@@ -517,8 +627,13 @@ def main():
             log(f"  Row {row_num}: {instant_reason}")
             continue
 
+        if instant_reason:
+            # File-only audit of WHY this lead needed a Claude call (e.g. tier downgrade).
+            vlog(f"  Row {row_num}: {instant_reason}")
+
         verdict, tokens, raw_text = call_claude(
-            build_prompt(cfg, lead_data, website_content, cfg["max_searches_per_lead"]), model)
+            build_prompt(cfg, lead_data, website_content, cfg["max_searches_per_lead"]), model,
+            row_ref=f"Row {row_num}: ")
 
         if verdict is None:
             counts["skipped"] += 1
