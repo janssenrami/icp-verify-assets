@@ -13,10 +13,10 @@ CONFIG (icp_config.json next to this script):
 {
   "sheets_key": "...",
   "icp_criteria": "...",
-  "model": "claude-sonnet-4-6",
-  "max_leads_per_run": 5,
+  "model": "claude-haiku-4-5-20251001",
+  "max_leads_per_run": 10,
   "max_searches_per_lead": 3,
-  "token_budget_per_run": 200000
+  "token_budget_per_run": 600000
 }
 
 USAGE
@@ -26,23 +26,25 @@ USAGE
 
 import argparse
 import base64
-import io
 import json
 import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from datetime import datetime
 
 from bs4 import BeautifulSoup
 
-# Force stdout/stderr to UTF-8 on Windows to handle non-ASCII characters in company names
-if hasattr(sys.stdout, "buffer"):
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-if hasattr(sys.stderr, "buffer"):
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+# Force stdout/stderr to UTF-8 on Windows to handle non-ASCII characters in company names.
+# reconfigure() (not a new TextIOWrapper): re-wrapping leaves the old wrapper to be GC'd,
+# which closes the shared buffer out from under the new one when two modules do it.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 _log_file = None
 _quiet = False
@@ -51,6 +53,14 @@ _quiet = False
 # under a minute; 120s turns a stuck subprocess into a fast skip (retried next run) and keeps
 # a 10-lead batch's worst case inside the skill's 600s tool timeout.
 CLAUDE_TIMEOUT_S = 120
+
+# prefetch_website() bounds. urlopen's timeout only bounds individual socket ops — a
+# slow-drip server or oversized body can hold a lead hostage indefinitely (the Jul 3
+# mid-lead hangs froze here). The chunked read enforces a byte cap + total deadline;
+# the thread watchdog is the belt-and-braces ceiling covering DNS/TLS/redirects/parse.
+_PREFETCH_MAX_BYTES = 512 * 1024
+_PREFETCH_READ_DEADLINE_S = 20
+_PREFETCH_HARD_TIMEOUT_S = 30
 
 try:
     import gspread
@@ -239,8 +249,10 @@ def open_sheet(cfg):
     # Bound every Sheets API call so a stalled connection can't hang the run forever.
     # gspread 6.x forwards this to requests as (connect, read) seconds.
     gc.set_timeout((10, 30))
-    sh = gc.open_by_key(cfg["sheets_key"])
-    return sh.get_worksheet(0)
+    # Startup calls get the same retry treatment as reads/writes — two production runs
+    # died here with header-only logs on a transient failure.
+    sh = _with_retry(lambda: gc.open_by_key(cfg["sheets_key"]), "Open spreadsheet")
+    return _with_retry(lambda: sh.get_worksheet(0), "Get worksheet")
 
 
 def get_unprocessed_rows(ws, force=False):
@@ -274,20 +286,37 @@ def get_col_map(ws):
 
 def write_result(ws, row_num, verdict, col_map):
     why = verdict["why"] if verdict["qualified"] == "NO" else ""
-    updates = [
-        {"range": f"{col_map['qualified']}{row_num}", "values": [[verdict["qualified"]]]},
-        {"range": f"{col_map['why']}{row_num}", "values": [[why]]},
-    ]
-    _with_retry(lambda: ws.batch_update(updates), "Sheet write")
+
+    def _do():
+        # Fresh dicts per attempt: gspread's batch_update absolutizes each range IN PLACE
+        # ("E377" -> "'Sheet1'!E377"), so reusing the list poisons a retry with a
+        # double-prefixed range ("'Sheet1'!'Sheet1'!E377" -> APIError: Unable to parse range).
+        return ws.batch_update([
+            {"range": f"{col_map['qualified']}{row_num}", "values": [[verdict["qualified"]]]},
+            {"range": f"{col_map['why']}{row_num}", "values": [[why]]},
+        ])
+
+    _with_retry(_do, "Sheet write")
 
 
-def prefetch_website(url):
+def _prefetch_website_inner(url):
     if not url or not url.startswith("http"):
         url = "https://" + url.lstrip("/")
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        # Chunked read: a single resp.read() has no total-time or size bound — a server
+        # dripping bytes (each recv within urlopen's socket timeout) could stall forever.
+        start = time.monotonic()
+        buf = bytearray()
         with urllib.request.urlopen(req, timeout=10) as resp:
-            html = resp.read().decode("utf-8", errors="ignore").replace('\x00', '')
+            while len(buf) < _PREFETCH_MAX_BYTES:
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                buf.extend(chunk)
+                if time.monotonic() - start > _PREFETCH_READ_DEADLINE_S:
+                    break
+        html = bytes(buf).decode("utf-8", errors="ignore").replace('\x00', '')
         soup = BeautifulSoup(html, "html.parser")
         for tag in soup(["script", "style", "noscript"]):
             tag.decompose()
@@ -335,6 +364,27 @@ def prefetch_website(url):
         return " ".join(priority_words[:350]) if priority_words else None
     except Exception:
         return None
+
+
+def prefetch_website(url):
+    """Wall-clock-bounded website prefetch. The inner fetch runs on a daemon thread so
+    DNS, TLS, redirects, and the BeautifulSoup parse are ALL bounded — none of those are
+    covered by urlopen's socket timeout. An abandoned thread holds its socket until this
+    batch process exits (bounded: at most a few per 10-lead batch); that leak is the price
+    of a guaranteed per-lead ceiling."""
+    result = [None]
+
+    def _target():
+        result[0] = _prefetch_website_inner(url)
+
+    t = threading.Thread(target=_target, daemon=True)
+    t.start()
+    t.join(timeout=_PREFETCH_HARD_TIMEOUT_S)
+    if t.is_alive():
+        vlog(f"  Website pre-fetch watchdog expired after {_PREFETCH_HARD_TIMEOUT_S}s "
+             f"({url}); abandoning fetch.")
+        return None
+    return result[0]
 
 
 def instant_qualify(lead_data, website_content):
